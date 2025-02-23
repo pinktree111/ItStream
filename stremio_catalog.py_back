@@ -1,0 +1,178 @@
+import json
+import os
+import requests
+import urllib.parse
+import re  # Per rimuovere il testo tra parentesi
+from fastapi import FastAPI, Request
+from fastapi.middleware.cors import CORSMiddleware
+
+# URL del file JSON online (Sostituire con una sorgente valida)
+URL = 'https://vavoo.to/channels'
+
+app = FastAPI()
+
+# Abilita CORS per consentire le richieste da Stremio
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],  # Permetti a qualsiasi dominio di accedere
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
+# Carica il dizionario dei loghi dal file dizionario.json
+dizionario_path = os.path.join(os.path.dirname(__file__), "dizionario.json")
+with open(dizionario_path, "r", encoding="utf-8") as f:
+    CHANNEL_LOGOS = json.load(f)
+
+# Lista delle categorie e relative parole chiave per la categorizzazione
+CATEGORY_KEYWORDS = {
+    "SKY": ["sky cin", "tv 8", "fox", "comedy central", "animal planet", "nat geo", "tv8", "sky atl", "sky uno", "sky prima", "sky serie", "sky arte", "sky docum", "sky natu", "cielo", "history", "sky tg"],
+    "RAI": ["rai"],
+    "MEDIASET": ["mediaset", "canale 5", "rete 4", "italia", "focus", "tg com 24", "tgcom 24", "premium crime", "iris", "mediaset iris", "cine 34", "27 twenty seven", "27 twentyseven"],
+    "DISCOVERY": ["discovery", "real time", "investigation", "top crime", "wwe", "hgtv", "nove", "dmax", "food network", "warner tv"],
+    "SPORT": ["sport", "dazn", "tennis", "moto", "f1", "golf", "sportitalia", "sport italia", "solo calcio", "solocalcio"],
+    "BAMBINI": ["boing", "cartoon", "k2", "discovery k2", "nick", "super", "frisbee"],
+    "ALTRI": []
+}
+
+# Funzione per determinare la categoria (o le categorie) del canale in base al nome
+def categorize_channel(channel_name: str) -> list:
+    cleaned_name = re.sub(r'\(.*?\)', '', channel_name).strip().lower()
+    genres = []
+    for category, keywords in CATEGORY_KEYWORDS.items():
+        for kw in keywords:
+            if kw in cleaned_name:
+                genres.append(category)
+                break
+    if not genres:
+        genres.append("ALTRI")
+    return genres
+
+# Funzione per processare il nome del canale e restituire il poster associato
+def generate_poster_url(channel_name: str) -> str:
+    cleaned_name = re.sub(r'\(.*?\)', '', channel_name).strip().lower()
+    return CHANNEL_LOGOS.get(cleaned_name, "")
+
+# Funzione per generare la lista dei canali italiani
+def get_italian_channels():
+    response = requests.get(URL)
+    if response.status_code == 200:
+        data = response.json()
+        channels = []
+        for entry in data:
+            if entry['country'] == 'Italy':
+                encoded_url = urllib.parse.quote(f"https://vavoo.to/play/{entry['id']}/index.m3u8", safe='')
+                stream_url = (
+                    f"https://mfp0bug.duckdns.org/proxy/hls/manifest.m3u8?"
+                    f"api_password=pachinopachiderma&d={encoded_url}"
+                    f"&h_user-agent={urllib.parse.quote('Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/133.0.0.0 Safari/537.36')}"
+                    f"&h_referer={urllib.parse.quote('https://newembedplay.xyz/')}"
+                    f"&h_origin={urllib.parse.quote('https://newembedplay.xyz')}"
+                )
+                poster_url = generate_poster_url(entry['name'])
+                channels.append({
+                    "id": f"tv:{entry['id']}",
+                    "name": entry['name'],
+                    "url": stream_url,
+                    "poster": poster_url,
+                    "genres": categorize_channel(entry['name'])
+                })
+        return channels
+    else:
+        return []
+
+# 📌 Endpoint per il Manifest JSON
+@app.get("/manifest.json")
+def get_manifest():
+    return {
+        "id": "org.stremio.italian.channels",
+        "version": "1.0.0",
+        "name": "Italian Channels",
+        "description": "Catalogo IPTV Italiano per Stremio",
+        "types": ["tv"],
+        "catalogs": [
+            {
+                "id": "italian_channels",
+                "name": "Italian IPTV",
+                "type": "tv",
+                "extra": [
+                    {"name": "search", "isRequired": False},
+                    {"name": "genre", "isRequired": False}
+                ]
+            }
+        ],
+        "resources": ["catalog", "stream", "meta"],
+        "idPrefixes": ["tv:"],
+        "logo": "https://i.imgur.com/3Tv3KQ1.png"
+    }
+
+# 📌 Endpoint per il Catalogo Canali
+@app.get("/catalog/tv/italian_channels.json")
+def get_catalog(request: Request):
+    genre_filter = request.query_params.get("genre", "").lower()
+    channels = get_italian_channels()
+    metas = [
+        {
+            "id": channel["id"],
+            "name": channel["name"],
+            "type": "tv",
+            "poster": channel["poster"],
+            "genres": channel["genres"]
+        }
+        for channel in channels
+    ]
+    if genre_filter:
+        metas = [m for m in metas if any(genre_filter in g.lower() for g in m.get("genres", []))]
+    return {"metas": metas}
+
+# 📌 Endpoint per la Ricerca nei Canali
+@app.get("/catalog/tv/italian_channels/search={query}.json")
+def search_catalog(query: str):
+    channels = get_italian_channels()
+    results = [
+        {
+            "id": channel["id"],
+            "name": channel["name"],
+            "type": "tv",
+            "poster": channel["poster"],
+            "genres": channel["genres"]
+        }
+        for channel in channels if query.lower() in channel["name"].lower()
+    ]
+    return {"metas": results}
+
+# 📌 Endpoint per ottenere lo Stream di un Canale
+@app.get("/stream/tv/{channel_id}.json")
+def get_stream(channel_id: str):
+    channels = get_italian_channels()
+    for channel in channels:
+        if channel["id"] == channel_id:
+            return {
+                "streams": [{
+                    "url": channel["url"],
+                    "title": channel["name"]
+                }]
+            }
+    return {"streams": []}
+
+# 📌 Endpoint per ottenere i Dettagli di un Canale
+@app.get("/meta/tv/{channel_id}.json")
+def get_meta(channel_id: str):
+    channels = get_italian_channels()
+    for channel in channels:
+        if channel["id"] == channel_id:
+            return {
+                "meta": {
+                    "id": channel["id"],
+                    "name": channel["name"],
+                    "type": "tv",
+                    "poster": channel["poster"],
+                    "background": "https://raw.githubusercontent.com/pinktree111/ittv/refs/heads/main/bg.jpg",
+                    "logo": channel["poster"],
+                    "description": f"Guarda {channel['name']} in streaming su Stremio.",
+                    "genres": channel["genres"],
+                    "streams": [{"url": channel["url"]}]
+                }
+            }
+    return {"error": "Canale non trovato", "meta": None}
